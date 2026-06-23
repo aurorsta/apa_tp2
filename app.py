@@ -1,21 +1,17 @@
 """
 Restaurant Recommender — minimal Streamlit deployment.
 
-Loads the serialized content-based recommender artifact (produced by Section 6 of
-TP2_Recommender_System_v8.ipynb) and lets the user pick a restaurant to get the
-top-10 most similar ones, using the same content+geo blend tuned in the notebook.
+Two modes:
+  1. "By restaurant" — pick a restaurant you like, get similar ones (content+geo similarity).
+  2. "By filters" — pick a cuisine and price range, get matching restaurants ranked by
+     average rating (no anchor restaurant needed — handles the cold-start case).
 
 Run locally with:
     streamlit run app.py
-
-Deploy on Streamlit Community Cloud:
-    1. Push this file + requirements.txt + recommender_artifact.pkl to a GitHub repo.
-    2. Go to https://share.streamlit.io, connect the repo, point it at app.py.
 """
 
 import pickle
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -26,9 +22,7 @@ def load_artifact(path: str = "recommender_artifact.pkl") -> dict:
         return pickle.load(f)
 
 
-def recommend(place_id, artifact: dict, top_n: int = 10) -> pd.DataFrame:
-    """Same logic as recommend_content_based_with_alpha in the notebook, but reading
-    from the serialized artifact instead of notebook globals."""
+def recommend_by_restaurant(place_id, artifact: dict, top_n: int = 10) -> pd.DataFrame:
     content_sim = artifact["content_sim"]
     geo_sim = artifact["geo_sim"]
     place_idx = artifact["place_idx"]
@@ -47,6 +41,23 @@ def recommend(place_id, artifact: dict, top_n: int = 10) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def recommend_by_filters(cuisines, price, artifact: dict, top_n: int = 10) -> pd.DataFrame:
+    places_full = artifact["places_full"]
+    candidates = places_full.copy()
+
+    if cuisines:
+        pattern = "|".join(cuisines)
+        candidates = candidates[candidates["cuisine"].str.contains(pattern, case=False, na=False)]
+
+    if price != "Any":
+        candidates = candidates[candidates["price"] == price]
+
+    # Rank by average rating where available; unrated restaurants fall to the bottom
+    # rather than being excluded, so new/unrated places still show up.
+    candidates = candidates.sort_values("avg_rating", ascending=False, na_position="last")
+    return candidates.head(top_n)
+
+
 st.set_page_config(page_title="Restaurant Recommender", page_icon="🍽️", layout="centered")
 st.title("🍽️ Restaurant Recommender")
 st.caption(
@@ -57,15 +68,46 @@ st.caption(
 artifact = load_artifact()
 places_full = artifact["places_full"]
 
-name_to_id = dict(zip(places_full["name"], places_full["placeID"]))
-selected_name = st.selectbox("Pick a restaurant you like:", sorted(name_to_id.keys()))
-top_n = st.slider("How many recommendations?", min_value=3, max_value=20, value=10)
+mode = st.radio("How would you like to search?", ["By cuisine & price", "By a restaurant I like"])
 
-if st.button("Recommend similar restaurants", type="primary"):
-    selected_id = name_to_id[selected_name]
-    results = recommend(selected_id, artifact, top_n=top_n)
-    st.subheader(f"Restaurants similar to **{selected_name}**")
-    st.dataframe(results, use_container_width=True, hide_index=True)
+if mode == "By cuisine & price":
+    all_cuisines = sorted(
+        {c.strip() for entry in places_full["cuisine"].dropna() for c in entry.split(",")}
+        - {"Unknown"}
+    )
+    selected_cuisines = st.multiselect("Cuisine type(s):", all_cuisines)
+
+    price_options = ["Any"] + sorted(places_full["price"].dropna().unique().tolist())
+    selected_price = st.selectbox("Price class:", price_options)
+
+    top_n = st.slider("How many results?", min_value=3, max_value=20, value=10, key="filter_n")
+
+    if st.button("Find restaurants", type="primary"):
+        results = recommend_by_filters(selected_cuisines, selected_price, artifact, top_n=top_n)
+        if results.empty:
+            st.warning("No restaurants match that combination — try fewer filters.")
+        else:
+            st.subheader("Matching restaurants")
+            st.dataframe(
+                results[["name", "cuisine", "price", "avg_rating"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+else:
+    name_to_id = dict(zip(places_full["name"], places_full["placeID"]))
+    selected_name = st.selectbox("Pick a restaurant you like:", sorted(name_to_id.keys()))
+    top_n = st.slider("How many recommendations?", min_value=3, max_value=20, value=10, key="sim_n")
+
+    if st.button("Recommend similar restaurants", type="primary"):
+        selected_id = name_to_id[selected_name]
+        results = recommend_by_restaurant(selected_id, artifact, top_n=top_n)
+        st.subheader(f"Restaurants similar to **{selected_name}**")
+        st.dataframe(
+            results[["name", "cuisine", "price", "similarity"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 st.divider()
 st.caption(
